@@ -54,8 +54,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ============== Pydantic Models (same as before) ==============
-# ... [Copy all Pydantic models from original main.py] ...
+# ============== Pydantic Models ==============
 
 class UserCreate(BaseModel):
     username: str
@@ -92,27 +91,49 @@ class ExportRequest(BaseModel):
 
 # ============== Twelve Labs Functions ==============
 
-def transcribe_with_twelvelabs(video_path: str) -> dict:
-    """Transcribe video using Twelve Labs API"""
+def transcribe_with_twelvelabs(video_path: str = None, video_url: str = None) -> dict:
+    """Transcribe video using Twelve Labs API - supports both files and URLs"""
     try:
-        print("Uploading video to Twelve Labs...", flush=True)
+        print("Processing with Twelve Labs...", flush=True)
         
-        # Upload video
-        task = twelvelabs_client.task.create(
-            index_id=TWELVELABS_INDEX_ID,
-            file=video_path,
-            language="en"
-        )
+        # IMPORTANT: Twelve Labs can process URLs directly!
+        if video_url:
+            print(f"✅ Using URL directly: {video_url}", flush=True)
+            task = twelvelabs_client.task.create(
+                index_id=TWELVELABS_INDEX_ID,
+                url=video_url,  # Pass URL directly - no download needed!
+                language="en"
+            )
+        elif video_path:
+            # Check file size before uploading
+            file_size = os.path.getsize(video_path) / (1024 * 1024)  # Convert to MB
+            print(f"File size: {file_size:.2f} MB", flush=True)
+            
+            if file_size > 500:  # 500MB safety limit
+                raise Exception(
+                    f"File too large ({file_size:.0f}MB). "
+                    f"Please use videos under 500MB or provide a YouTube/Vimeo URL instead."
+                )
+            
+            print("Uploading file to Twelve Labs...", flush=True)
+            with open(video_path, 'rb') as file:
+                task = twelvelabs_client.task.create(
+                    index_id=TWELVELABS_INDEX_ID,
+                    file=file,
+                    language="en"
+                )
+        else:
+            raise Exception("Either video_path or video_url must be provided")
         
         print(f"Task created: {task.id}", flush=True)
-        print("Waiting for processing...", flush=True)
+        print("Processing video (this may take 1-5 minutes depending on length)...", flush=True)
         
-        # Wait for processing (can take 1-5 minutes)
+        # Wait for Twelve Labs to process
         def on_task_update(task):
-            print(f"Progress: {task.status}", flush=True)
+            print(f"  Status: {task.status}", flush=True)
         
         task.wait_for_done(
-            sleep_interval=5,
+            sleep_interval=10,
             callback=on_task_update
         )
         
@@ -120,44 +141,66 @@ def transcribe_with_twelvelabs(video_path: str) -> dict:
             raise Exception(f"Task failed with status: {task.status}")
         
         video_id = task.video_id
-        print(f"Video processed! ID: {video_id}", flush=True)
+        print(f"✅ Video processed! ID: {video_id}", flush=True)
         
-        # Get transcript
-        print("Fetching transcript...", flush=True)
+        # Get comprehensive transcript with timestamps
+        print("Fetching detailed transcript...", flush=True)
         transcript_result = twelvelabs_client.generate.text(
             video_id=video_id,
-            prompt="Provide a complete, accurate transcript of this video with speaker labels and timestamps."
+            prompt="Provide a complete, word-for-word transcript of this video. Include all spoken content in detail."
         )
         
-        # Get video info for duration
+        # Get video metadata
         video_info = twelvelabs_client.index.video.get(
             index_id=TWELVELABS_INDEX_ID,
             id=video_id
         )
         
         duration = video_info.metadata.duration if hasattr(video_info.metadata, 'duration') else 0
-        
-        # Parse transcript into segments
-        # Twelve Labs returns formatted text, we'll create simple segments
         full_text = transcript_result.data
         
-        # Create simple segments (we can enhance this later)
-        segments = [{
-            "start": 0,
-            "end": duration,
-            "text": full_text
-        }]
+        # Create basic segments (Twelve Labs doesn't provide detailed timestamps in free tier)
+        # We'll create segments based on duration
+        segments = []
+        if duration > 0:
+            # Split into roughly 5-minute segments for better time-based summaries
+            segment_duration = 300  # 5 minutes in seconds
+            num_segments = max(1, int(duration / segment_duration))
+            segment_length = len(full_text) // num_segments
+            
+            for i in range(num_segments):
+                start_time = i * segment_duration
+                end_time = min((i + 1) * segment_duration, duration)
+                start_char = i * segment_length
+                end_char = (i + 1) * segment_length if i < num_segments - 1 else len(full_text)
+                
+                segments.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "text": full_text[start_char:end_char].strip()
+                })
+        else:
+            # Fallback: single segment
+            segments = [{
+                "start": 0,
+                "end": 0,
+                "text": full_text
+            }]
+        
+        print(f"✅ Created {len(segments)} transcript segments", flush=True)
         
         return {
             "full_text": full_text,
             "segments": segments,
             "duration": duration,
-            "video_id": video_id  # Store for future reference
+            "video_id": video_id
         }
         
     except Exception as e:
-        print(f"Twelve Labs error: {str(e)}", flush=True)
-        raise HTTPException(status_code=500, detail=f"Twelve Labs transcription failed: {str(e)}")
+        error_msg = str(e)
+        print(f"❌ Twelve Labs error: {error_msg}", flush=True)
+        raise HTTPException(status_code=500, detail=f"Twelve Labs transcription failed: {error_msg}")
+
 
 def transcribe_with_openai(file_path: str) -> dict:
     """Transcribe audio using OpenAI Whisper API"""
@@ -191,15 +234,18 @@ def transcribe_with_openai(file_path: str) -> dict:
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OpenAI transcription failed: {str(e)}")
 
-def transcribe_video(video_path: str) -> dict:
-    """Transcribe video using selected provider"""
+
+def transcribe_video(video_path: str = None, video_url: str = None) -> dict:
+    """Transcribe video using selected AI provider"""
     if AI_PROVIDER == "twelvelabs":
-        return transcribe_with_twelvelabs(video_path)
+        return transcribe_with_twelvelabs(video_path=video_path, video_url=video_url)
     else:
-        # Extract audio for OpenAI
+        # OpenAI requires audio extraction
+        if not video_path:
+            raise HTTPException(status_code=400, detail="OpenAI provider requires a video file")
+        
         audio_path = video_path.replace(Path(video_path).suffix, '.wav')
         extract_audio(video_path, audio_path)
-        
         transcribe_path = audio_path if os.path.exists(audio_path) else video_path
         result = transcribe_with_openai(transcribe_path)
         
@@ -208,6 +254,7 @@ def transcribe_video(video_path: str) -> dict:
             os.remove(audio_path)
         
         return result
+
 
 # ============== Helper Functions ==============
 
@@ -225,7 +272,7 @@ def extract_audio(video_path: str, audio_path: str):
         return False
 
 def download_video_from_url(url: str, output_path: str) -> str:
-    """Download video from URL"""
+    """Download video from URL (only used for OpenAI provider)"""
     ydl_opts = {
         'format': 'best[ext=mp4]/best',
         'outtmpl': output_path,
@@ -275,8 +322,6 @@ Respond in JSON format:
     )
     
     return json.loads(response.choices[0].message.content)
-
-# [Copy all other generation functions: generate_quiz, generate_study_plan, generate_practice_problems, generate_flashcards, etc.]
 
 def generate_quiz(transcript: str) -> List[dict]:
     response = openai.chat.completions.create(
@@ -422,32 +467,43 @@ async def upload_lecture(
         print(f"Title: {title}", file=sys.stderr)
         print("="*50 + "\n", file=sys.stderr)
         
-        if file:
+        # Validate input
+        if not file and not video_url:
+            raise HTTPException(status_code=400, detail="Either file or video_url must be provided")
+        
+        # For Twelve Labs with URLs - skip download entirely!
+        if AI_PROVIDER == "twelvelabs" and video_url:
+            print("✅ Using Twelve Labs with URL - no download needed!", file=sys.stderr)
+            transcript_data = transcribe_video(video_url=video_url)
+            video_source = "url"
+            source_url = video_url
+            
+        # For file uploads
+        elif file:
             print("Processing file upload...", file=sys.stderr)
             with tempfile.NamedTemporaryFile(delete=False, suffix=Path(file.filename).suffix) as tmp_file:
                 content = await file.read()
                 tmp_file.write(content)
                 video_path = tmp_file.name
+            
+            print(f"Video saved to: {video_path}", file=sys.stderr)
+            transcript_data = transcribe_video(video_path=video_path)
             video_source = "upload"
             source_url = None
+            
+        # For OpenAI with URLs - need to download
         elif video_url:
-            print("Processing URL download...", file=sys.stderr)
+            print("Downloading video from URL...", file=sys.stderr)
             with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
                 video_path = tmp_file.name
             video_path = download_video_from_url(video_url, video_path)
+            
+            print(f"Video downloaded to: {video_path}", file=sys.stderr)
+            transcript_data = transcribe_video(video_path=video_path)
             video_source = "url"
             source_url = video_url
-        else:
-            raise HTTPException(status_code=400, detail="File or URL required")
         
-        print(f"Video saved to: {video_path}", file=sys.stderr)
-        
-        # Transcribe using selected provider
-        print(f"Transcribing with {AI_PROVIDER}...", file=sys.stderr)
-        transcript_data = transcribe_video(video_path)
-        print("Transcription complete!", file=sys.stderr)
-        
-        # Generate content with GPT-4
+        # Generate educational content with OpenAI (always)
         print("Generating summary...", file=sys.stderr)
         summary_data = generate_summary(transcript_data['full_text'])
         
@@ -463,7 +519,7 @@ async def upload_lecture(
         print("Generating flashcards...", file=sys.stderr)
         flashcards = generate_flashcards(transcript_data['full_text'], summary_data['key_points'])
         
-        # Save to database
+        # Create lecture in database
         print("Saving to database...", file=sys.stderr)
         lecture = Lecture(
             title=title,
@@ -486,21 +542,29 @@ async def upload_lecture(
         db.commit()
         db.refresh(lecture)
         
-        print("SUCCESS!", file=sys.stderr)
+        print("✅ SUCCESS! Lecture saved.", file=sys.stderr)
+        print("="*50 + "\n", file=sys.stderr)
+        
         return lecture
         
     except Exception as e:
         print("\n" + "!"*50, file=sys.stderr)
         print("ERROR:", file=sys.stderr)
-        print(traceback.format_exc(), file=sys.stderr)
+        print(f"  Type: {type(e).__name__}", file=sys.stderr)
+        print(f"  Message: {str(e)}", file=sys.stderr)
+        print("\nTraceback:", file=sys.stderr)
+        traceback.print_exc(file=sys.stderr)
         print("!"*50 + "\n", file=sys.stderr)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
         
     finally:
+        # Cleanup temporary files
         if video_path and os.path.exists(video_path):
-            os.remove(video_path)
-
-# [Copy all other endpoints from original main.py: auth, lectures, progress, quiz, flashcards, groups, export]
+            try:
+                os.remove(video_path)
+                print(f"Cleaned up: {video_path}", file=sys.stderr)
+            except:
+                pass
 
 # ============== Auth Endpoints ==============
 
@@ -548,7 +612,7 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
     }
 
 @app.get("/api/auth/me")
-async def get_me(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+async def get_me(current_user: User = Depends(get_current_user)):
     return {"id": current_user.id, "username": current_user.username, "email": current_user.email}
 
 @app.get("/api/lectures")
@@ -556,12 +620,372 @@ async def get_lectures(current_user: User = Depends(get_current_user), db: Sessi
     lectures = db.query(Lecture).filter(Lecture.owner_id == current_user.id).all()
     return lectures
 
+@app.get("/api/lectures/{lecture_id}")
+async def get_lecture(lecture_id: int, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    lecture = db.query(Lecture).filter(Lecture.id == lecture_id, Lecture.owner_id == current_user.id).first()
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    return lecture
+
+@app.post("/api/timestamp-summary")
+async def get_timestamp_summary(
+    request: TimestampSummaryRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    lecture = db.query(Lecture).filter(
+        Lecture.id == request.lecture_id,
+        Lecture.owner_id == current_user.id
+    ).first()
+    
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    
+    # Get transcript for time range
+    transcript_segment = get_transcript_by_timerange(
+        lecture.transcript_with_timestamps,
+        request.start_time,
+        request.end_time
+    )
+    
+    # Generate summary for this time range
+    summary_data = generate_summary(transcript_segment, request.start_time, request.end_time)
+    
+    return {
+        "start_time": request.start_time,
+        "end_time": request.end_time,
+        "summary": summary_data["summary"],
+        "key_points": summary_data["key_points"]
+    }
+
+@app.post("/api/progress")
+async def update_progress(
+    progress: ProgressUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    lecture_progress = db.query(LectureProgress).filter(
+        LectureProgress.lecture_id == progress.lecture_id,
+        LectureProgress.user_id == current_user.id
+    ).first()
+    
+    if not lecture_progress:
+        lecture_progress = LectureProgress(
+            lecture_id=progress.lecture_id,
+            user_id=current_user.id
+        )
+        db.add(lecture_progress)
+    
+    if progress.last_position is not None:
+        lecture_progress.last_position = progress.last_position
+    if progress.completed is not None:
+        lecture_progress.completed = progress.completed
+    if progress.notes is not None:
+        lecture_progress.notes = progress.notes
+    
+    lecture_progress.last_accessed = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(lecture_progress)
+    return lecture_progress
+
+@app.get("/api/progress/{lecture_id}")
+async def get_progress(
+    lecture_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = db.query(LectureProgress).filter(
+        LectureProgress.lecture_id == lecture_id,
+        LectureProgress.user_id == current_user.id
+    ).first()
+    
+    if not progress:
+        return {"lecture_id": lecture_id, "last_position": 0, "completed": False, "notes": ""}
+    
+    return progress
+
+@app.post("/api/submit-quiz")
+async def submit_quiz(
+    submission: QuizSubmit,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    lecture = db.query(Lecture).filter(
+        Lecture.id == submission.lecture_id,
+        Lecture.owner_id == current_user.id
+    ).first()
+    
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    
+    results = []
+    correct_count = 0
+    
+    for i, answer in enumerate(submission.answers):
+        if i < len(lecture.quiz):
+            is_correct = answer == lecture.quiz[i]["correct_answer"]
+            if is_correct:
+                correct_count += 1
+            
+            results.append({
+                "question_index": i,
+                "user_answer": answer,
+                "correct_answer": lecture.quiz[i]["correct_answer"],
+                "is_correct": is_correct,
+                "explanation": lecture.quiz[i]["explanation"]
+            })
+    
+    score = (correct_count / len(lecture.quiz)) * 100 if lecture.quiz else 0
+    
+    # Update progress
+    progress = db.query(LectureProgress).filter(
+        LectureProgress.lecture_id == submission.lecture_id,
+        LectureProgress.user_id == current_user.id
+    ).first()
+    
+    if progress:
+        progress.quiz_attempts = (progress.quiz_attempts or 0) + 1
+        progress.quiz_score = score
+        db.commit()
+    
+    return {
+        "score": score,
+        "correct": correct_count,
+        "total": len(lecture.quiz),
+        "results": results
+    }
+
+@app.get("/api/flashcards/{lecture_id}")
+async def get_flashcards(
+    lecture_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    lecture = db.query(Lecture).filter(
+        Lecture.id == lecture_id,
+        Lecture.owner_id == current_user.id
+    ).first()
+    
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    
+    return {"flashcards": lecture.flashcards}
+
+@app.get("/api/flashcards/due/{lecture_id}")
+async def get_due_flashcards(
+    lecture_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    now = datetime.utcnow()
+    due_cards = db.query(FlashcardProgress).filter(
+        FlashcardProgress.lecture_id == lecture_id,
+        FlashcardProgress.user_id == current_user.id,
+        FlashcardProgress.next_review <= now
+    ).all()
+    
+    return {"due_count": len(due_cards), "cards": due_cards}
+
+@app.post("/api/flashcards/review")
+async def review_flashcard(
+    review: FlashcardReview,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    progress = db.query(FlashcardProgress).filter(
+        FlashcardProgress.lecture_id == review.lecture_id,
+        FlashcardProgress.user_id == current_user.id,
+        FlashcardProgress.flashcard_index == review.flashcard_index
+    ).first()
+    
+    if not progress:
+        progress = FlashcardProgress(
+            lecture_id=review.lecture_id,
+            user_id=current_user.id,
+            flashcard_index=review.flashcard_index
+        )
+        db.add(progress)
+    
+    ease_factor, interval, repetitions, next_review = calculate_next_review(
+        review.quality,
+        progress.ease_factor,
+        progress.interval,
+        progress.repetitions
+    )
+    
+    progress.ease_factor = ease_factor
+    progress.interval = interval
+    progress.repetitions = repetitions
+    progress.next_review = next_review
+    progress.last_reviewed = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(progress)
+    
+    return progress
+
+@app.get("/api/groups")
+async def get_groups(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    groups = db.query(StudyGroup).filter(
+        StudyGroup.members.contains([current_user.id])
+    ).all()
+    return groups
+
+@app.post("/api/groups")
+async def create_group(
+    group: GroupCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    invite_code = secrets.token_urlsafe(8)
+    
+    new_group = StudyGroup(
+        name=group.name,
+        description=group.description,
+        creator_id=current_user.id,
+        invite_code=invite_code,
+        members=[current_user.id]
+    )
+    
+    db.add(new_group)
+    db.commit()
+    db.refresh(new_group)
+    
+    return new_group
+
+@app.post("/api/groups/join/{invite_code}")
+async def join_group(
+    invite_code: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    group = db.query(StudyGroup).filter(StudyGroup.invite_code == invite_code).first()
+    
+    if not group:
+        raise HTTPException(status_code=404, detail="Group not found")
+    
+    if current_user.id not in group.members:
+        group.members.append(current_user.id)
+        db.commit()
+        db.refresh(group)
+    
+    return group
+
+@app.post("/api/groups/{group_id}/share/{lecture_id}")
+async def share_lecture(
+    group_id: int,
+    lecture_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    group = db.query(StudyGroup).filter(StudyGroup.id == group_id).first()
+    lecture = db.query(Lecture).filter(Lecture.id == lecture_id).first()
+    
+    if not group or not lecture:
+        raise HTTPException(status_code=404, detail="Group or lecture not found")
+    
+    if current_user.id not in group.members:
+        raise HTTPException(status_code=403, detail="Not a member")
+    
+    if lecture_id not in group.shared_lectures:
+        group.shared_lectures.append(lecture_id)
+        db.commit()
+    
+    return {"message": "Lecture shared successfully"}
+
+@app.post("/api/export")
+async def export_lecture(
+    request: ExportRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    lecture = db.query(Lecture).filter(
+        Lecture.id == request.lecture_id,
+        Lecture.owner_id == current_user.id
+    ).first()
+    
+    if not lecture:
+        raise HTTPException(status_code=404, detail="Lecture not found")
+    
+    if request.format == "pdf":
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        styles = getSampleStyleSheet()
+        story = []
+        
+        # Title
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor='#1a1a1a',
+            spaceAfter=30
+        )
+        story.append(Paragraph(lecture.title, title_style))
+        story.append(Spacer(1, 12))
+        
+        # Summary
+        story.append(Paragraph("Summary", styles['Heading2']))
+        story.append(Paragraph(lecture.summary, styles['BodyText']))
+        story.append(Spacer(1, 12))
+        
+        # Key Points
+        story.append(Paragraph("Key Points", styles['Heading2']))
+        for point in lecture.key_points:
+            story.append(Paragraph(f"• {point}", styles['BodyText']))
+        story.append(PageBreak())
+        
+        # Flashcards
+        story.append(Paragraph("Flashcards", styles['Heading2']))
+        for card in lecture.flashcards:
+            story.append(Paragraph(f"<b>Q:</b> {card['front']}", styles['BodyText']))
+            story.append(Paragraph(f"<b>A:</b> {card['back']}", styles['BodyText']))
+            story.append(Spacer(1, 12))
+        
+        doc.build(story)
+        buffer.seek(0)
+        
+        from fastapi.responses import StreamingResponse
+        return StreamingResponse(
+            buffer,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={lecture.title}.pdf"}
+        )
+    
+    elif request.format == "markdown":
+        md_content = f"# {lecture.title}\n\n"
+        md_content += f"## Summary\n\n{lecture.summary}\n\n"
+        md_content += "## Key Points\n\n"
+        for point in lecture.key_points:
+            md_content += f"- {point}\n"
+        md_content += "\n## Flashcards\n\n"
+        for card in lecture.flashcards:
+            md_content += f"**Q:** {card['front']}\n\n"
+            md_content += f"**A:** {card['back']}\n\n"
+        
+        from fastapi.responses import Response
+        return Response(
+            content=md_content,
+            media_type="text/markdown",
+            headers={"Content-Disposition": f"attachment; filename={lecture.title}.md"}
+        )
+
 @app.get("/")
 async def root():
     return {
         "message": "Lecture Learning Platform API",
         "status": "running",
-        "ai_provider": AI_PROVIDER
+        "ai_provider": AI_PROVIDER,
+        "features": {
+            "video_transcription": True,
+            "ai_summaries": True,
+            "quizzes": True,
+            "flashcards": True,
+            "spaced_repetition": True,
+            "study_groups": True,
+            "export": ["pdf", "markdown"]
+        }
     }
 
 if __name__ == "__main__":

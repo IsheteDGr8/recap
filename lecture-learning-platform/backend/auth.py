@@ -5,9 +5,10 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from models import User
+from database import get_db
 import os
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
+SECRET_KEY = os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -33,7 +34,7 @@ def verify_token(token: str):
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid authentication credentials")
 
-async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = None):
+async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
     username = verify_token(token)
     user = db.query(User).filter(User.username == username).first()
     if user is None:

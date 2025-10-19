@@ -149,10 +149,15 @@ function App() {
       
       if (response.ok) {
         const data = await response.json();
-        setToken(data.access_token);
-        localStorage.setItem('token', data.access_token);
+        const newToken = data.access_token;
+        setToken(newToken);
+        localStorage.setItem('token', newToken);
         setUser({ username: data.username, email: data.email });
         setIsAuthenticated(true);
+        // Give token state time to update
+        setTimeout(() => {
+          fetchLectures();
+        }, 100);
       } else {
         const error = await response.json();
         alert(error.detail || 'Registration failed');
@@ -175,10 +180,17 @@ function App() {
   const fetchLectures = async () => {
     try {
       const response = await apiCall('/api/lectures');
+      if (!response.ok) {
+        console.error('Failed to fetch lectures:', response.status);
+        setLectures([]);
+        return;
+      }
       const data = await response.json();
-      setLectures(data);
+      // Ensure data is an array
+      setLectures(Array.isArray(data) ? data : []);
     } catch (error) {
       console.error('Error fetching lectures:', error);
+      setLectures([]);
     }
   };
 
